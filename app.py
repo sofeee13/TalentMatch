@@ -1,5 +1,13 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
+import os
+import re
+import hashlib
+import hmac
+import secrets
+import json
+from datetime import datetime, timezone
 
 from resume_parser import parse_resume
 from job_analyzer import analyze_job
@@ -427,6 +435,284 @@ st.markdown(
 
 
 # ============================================================
+# EMAIL AUTHENTICATION (SQLite + PBKDF2 password hashing)
+# ============================================================
+# Local development uses a SQLite file beside app.py. For a deployed,
+# multi-user production app, move this database to persistent storage.
+AUTH_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "talentmatch_users.db")
+PASSWORD_ITERATIONS = 310_000
+
+
+def get_auth_connection():
+    conn = sqlite3.connect(AUTH_DB_PATH, timeout=15)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_email TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            job_title TEXT NOT NULL DEFAULT 'Open Position',
+            score REAL NOT NULL DEFAULT 0,
+            experience_years REAL NOT NULL DEFAULT 0,
+            skills_json TEXT NOT NULL DEFAULT '[]',
+            matched_json TEXT NOT NULL DEFAULT '[]',
+            missing_json TEXT NOT NULL DEFAULT '[]',
+            explanation TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT 'Applied',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_email, candidate_id, job_title)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def valid_email(email):
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email or ""))
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), PASSWORD_ITERATIONS
+    ).hex()
+    return digest, salt
+
+
+def create_user(email, password):
+    password_hash, salt = hash_password(password)
+    try:
+        with get_auth_connection() as conn:
+            conn.execute(
+                "INSERT INTO users (email, password_hash, salt) VALUES (?, ?, ?)",
+                (email, password_hash, salt),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def authenticate_user(email, password):
+    with get_auth_connection() as conn:
+        row = conn.execute(
+            "SELECT password_hash, salt FROM users WHERE email = ?", (email,)
+        ).fetchone()
+    if not row:
+        return False
+    expected_hash, salt = row
+    actual_hash, _ = hash_password(password, salt)
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
+PIPELINE_STAGES = ["Applied", "Screening", "Shortlisted", "Interview", "Selected", "Hired", "Rejected"]
+
+
+def save_ranked_candidates(owner_email, ranked, job_title):
+    """Persist the latest comparison while retaining any existing stage and recruiter notes."""
+    with get_auth_connection() as conn:
+        for item in ranked:
+            candidate_id = str(item.get("candidate_id", "Unknown"))
+            skills = item.get("skills", [])
+            conn.execute("""
+                INSERT INTO pipeline_candidates
+                    (owner_email, candidate_id, job_title, score, experience_years,
+                     skills_json, matched_json, missing_json, explanation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_email, candidate_id, job_title) DO UPDATE SET
+                    score=excluded.score,
+                    experience_years=excluded.experience_years,
+                    skills_json=excluded.skills_json,
+                    matched_json=excluded.matched_json,
+                    missing_json=excluded.missing_json,
+                    explanation=excluded.explanation,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                owner_email, candidate_id, job_title,
+                float(item.get("score", 0) or 0),
+                float(item.get("experience_years", 0) or 0),
+                json.dumps(skills if isinstance(skills, list) else []),
+                json.dumps(item.get("matched_skills", []) if isinstance(item.get("matched_skills", []), list) else []),
+                json.dumps(item.get("missing_skills", []) if isinstance(item.get("missing_skills", []), list) else []),
+                str(item.get("explanation", "")),
+            ))
+
+
+def get_pipeline_records(owner_email):
+    with get_auth_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, candidate_id, job_title, score, experience_years,
+                   skills_json, matched_json, missing_json, explanation,
+                   stage, notes, created_at, updated_at
+            FROM pipeline_candidates WHERE owner_email = ?
+            ORDER BY updated_at DESC, candidate_id COLLATE NOCASE
+        """, (owner_email,)).fetchall()
+    columns = ["id", "candidate_id", "job_title", "score", "experience_years",
+               "skills_json", "matched_json", "missing_json", "explanation",
+               "stage", "notes", "created_at", "updated_at"]
+    records = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        for field, source in [("skills", "skills_json"), ("matched_skills", "matched_json"), ("missing_skills", "missing_json")]:
+            try:
+                item[field] = json.loads(item[source] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item[field] = []
+        records.append(item)
+    return records
+
+
+def update_pipeline_record(record_id, owner_email, stage, notes):
+    if stage not in PIPELINE_STAGES:
+        return False
+    with get_auth_connection() as conn:
+        cursor = conn.execute("""
+            UPDATE pipeline_candidates
+            SET stage = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND owner_email = ?
+        """, (stage, notes, int(record_id), owner_email))
+        return cursor.rowcount == 1
+
+
+def render_auth_page():
+    # Premium split-screen authentication page using the app's navy / teal / ivory palette.
+    st.markdown(
+        """
+        <style>
+        /* Auth-only canvas */
+        [data-testid="stAppViewContainer"] { background:#F5F8F7 !important; }
+        [data-testid="stMainBlockContainer"] { max-width:1180px !important; padding-top:2.2rem !important; }
+        .auth-shell { min-height:610px; display:flex; align-items:stretch; gap:0; }
+        .auth-brand-panel {
+            min-height:590px; height:100%; box-sizing:border-box; position:relative; overflow:hidden;
+            padding:42px 38px; border-radius:25px; color:#FFFFFF;
+            background:linear-gradient(145deg,#172B3A 0%,#203F4B 58%,#087E78 130%);
+            box-shadow:0 22px 55px rgba(23,43,58,.13);
+        }
+        .auth-brand-panel:before,.auth-brand-panel:after { content:""; position:absolute; border:1px solid rgba(216,243,106,.22); border-radius:50%; pointer-events:none; }
+        .auth-brand-panel:before { width:310px;height:310px;right:-135px;top:-95px;box-shadow:0 0 0 28px rgba(216,243,106,.035),0 0 0 58px rgba(216,243,106,.025); }
+        .auth-brand-panel:after { width:210px;height:210px;right:-75px;bottom:-105px; }
+        .auth-logo { display:flex; align-items:center; gap:11px; color:#FFFFFF; font-size:1.48rem; font-weight:900; letter-spacing:-.8px; position:relative; z-index:1; }
+        .auth-logo-mark { display:flex; align-items:center; justify-content:center; width:39px;height:39px; border-radius:12px; background:#D8F36A; color:#172B3A; font-size:1.3rem; }
+        .auth-eyebrow { margin-top:72px; color:#D8F36A; font-size:.68rem; font-weight:900; letter-spacing:2px; text-transform:uppercase; position:relative; z-index:1; }
+        .auth-headline { margin:13px 0 14px; max-width:440px; color:#FFFFFF !important; font-size:2.65rem; line-height:1.08; font-weight:900; letter-spacing:-1.8px; position:relative; z-index:1; }
+        .auth-copy { max-width:410px; color:#D0DDE0 !important; font-size:.98rem; line-height:1.7; position:relative; z-index:1; }
+        .auth-feature-list { display:grid; gap:13px; margin-top:34px; position:relative; z-index:1; }
+        .auth-feature { display:flex; align-items:center; gap:12px; color:#F3F7F6; font-size:.86rem; font-weight:650; }
+        .auth-feature-icon { display:flex; align-items:center; justify-content:center; flex:0 0 30px; width:30px;height:30px; border-radius:9px; background:rgba(216,243,106,.13); color:#D8F36A; font-size:.95rem; }
+        .auth-panel-note { position:absolute; bottom:28px; left:38px; color:#B8C9CD; font-size:.72rem; letter-spacing:.2px; z-index:1; }
+        .auth-form-heading { color:#172B3A !important; font-size:1.85rem; line-height:1.15; font-weight:900; letter-spacing:-1px; margin:14px 0 5px; }
+        .auth-form-sub { color:#6D7D87 !important; font-size:.88rem; margin:0 0 22px; }
+        [data-testid="stTabs"] { margin-top:7px; }
+        [data-testid="stTabs"] [data-baseweb="tab-list"] { gap:22px; border-bottom:1px solid #DFE7E8; }
+        [data-testid="stTabs"] button { color:#60727C !important; font-weight:800 !important; font-size:.86rem !important; padding:12px 2px !important; }
+        [data-testid="stTabs"] button p,[data-testid="stTabs"] button span { color:inherit !important; opacity:1 !important; }
+        [data-testid="stTabs"] button[aria-selected="true"], [data-testid="stTabs"] button[aria-selected="true"] p { color:#087E78 !important; }
+        [data-testid="stTabs"] [data-baseweb="tab-highlight"] { background:#087E78 !important; height:3px !important; }
+        [data-testid="stForm"] { background:transparent !important; border:0 !important; padding:19px 0 0 !important; box-shadow:none !important; }
+        [data-testid="stForm"] label,[data-testid="stForm"] label p,[data-testid="stForm"] [data-testid="stWidgetLabel"] p { color:#172B3A !important; opacity:1 !important; font-weight:800 !important; font-size:.8rem !important; }
+        [data-testid="stForm"] input { min-height:47px; color:#172B3A !important; background:#FFFFFF !important; border:1px solid #CFDADB !important; border-radius:11px !important; opacity:1 !important; }
+        [data-testid="stForm"] input:focus { border-color:#087E78 !important; box-shadow:0 0 0 3px rgba(8,126,120,.11) !important; }
+        [data-testid="stForm"] input::placeholder { color:#8A989E !important; opacity:1 !important; }
+        [data-testid="stForm"] button[kind="primary"] { min-height:48px; margin-top:8px; background:#087E78 !important; color:#FFFFFF !important; border:1px solid #087E78 !important; border-radius:11px !important; font-weight:850 !important; transition:all .18s ease; }
+        [data-testid="stForm"] button[kind="primary"]:hover { background:#06645F !important; border-color:#06645F !important; box-shadow:0 7px 18px rgba(8,126,120,.18); transform:translateY(-1px); }
+        [data-testid="stForm"] button[kind="primary"] p { color:#FFFFFF !important; }
+        [data-testid="stAlert"] { border-radius:11px !important; }
+        .auth-trust { color:#7B898F !important; font-size:.72rem; text-align:center; margin-top:24px; }
+        .auth-bottom { color:#89969B !important; font-size:.7rem; text-align:center; margin-top:26px; }
+        @media(max-width:850px) {
+            [data-testid="stMainBlockContainer"] { padding:1rem 1rem 2rem !important; }
+            .auth-brand-panel { min-height:300px; padding:28px 25px; }
+            .auth-eyebrow { margin-top:35px; }
+            .auth-headline { font-size:2rem; }
+            .auth-panel-note { position:relative; bottom:auto; left:auto; margin-top:25px; }
+            .auth-form-heading { margin-top:25px; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1.03, 0.97], gap="large", vertical_alignment="center")
+    with left:
+        st.markdown(
+            """
+            <div class="auth-brand-panel">
+              <div class="auth-logo"><span class="auth-logo-mark">✳</span><span>TalentMatch</span></div>
+              <div class="auth-eyebrow">THE SMARTER WAY TO HIRE</div>
+              <div class="auth-headline">Find the people who move your team forward.</div>
+              <div class="auth-copy">Bring your hiring workflow together with intelligent resume screening, candidate insights and confident decisions.</div>
+              <div class="auth-feature-list">
+                <div class="auth-feature"><span class="auth-feature-icon">✓</span>AI-powered resume screening</div>
+                <div class="auth-feature"><span class="auth-feature-icon">⌁</span>Clear candidate comparisons</div>
+                <div class="auth-feature"><span class="auth-feature-icon">◎</span>Thoughtful, fairer hiring reviews</div>
+              </div>
+              <div class="auth-panel-note">A more focused hiring workspace · TalentMatch</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown('<div class="auth-form-heading">Welcome back</div><div class="auth-form-sub">Sign in to continue to your hiring workspace.</div>', unsafe_allow_html=True)
+        tab_login, tab_signup = st.tabs(["Sign in", "Create account"])
+
+        with tab_login:
+            with st.form("tm_login_form"):
+                email = st.text_input("Email address", placeholder="you@example.com").strip().lower()
+                password = st.text_input("Password", type="password", placeholder="Enter your password")
+                submitted = st.form_submit_button("Sign in to TalentMatch", use_container_width=True, type="primary")
+            if submitted:
+                if not valid_email(email) or not password:
+                    st.error("Enter a valid email address and password.")
+                elif authenticate_user(email, password):
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = email
+                    st.rerun()
+                else:
+                    st.error("Email or password is incorrect.")
+
+        with tab_signup:
+            with st.form("tm_signup_form"):
+                new_email = st.text_input("Email address", placeholder="you@example.com", key="tm_signup_email").strip().lower()
+                new_password = st.text_input("Password", type="password", placeholder="At least 8 characters", key="tm_signup_password")
+                confirm_password = st.text_input("Confirm password", type="password", placeholder="Re-enter your password", key="tm_signup_confirm")
+                create_submitted = st.form_submit_button("Create your account", use_container_width=True, type="primary")
+            if create_submitted:
+                if not valid_email(new_email):
+                    st.error("Enter a valid email address.")
+                elif len(new_password) < 8:
+                    st.error("Use a password with at least 8 characters.")
+                elif new_password != confirm_password:
+                    st.error("The passwords do not match.")
+                elif create_user(new_email, new_password):
+                    st.success("Account created. You can now sign in.")
+                else:
+                    st.error("An account with this email already exists.")
+
+        st.markdown('<div class="auth-trust">🔒 Your account credentials are protected with password hashing.</div><div class="auth-bottom">© TalentMatch · Intelligent hiring workspace</div>', unsafe_allow_html=True)
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
+
+if not st.session_state.authenticated:
+    render_auth_page()
+    st.stop()
+
+
+# ============================================================
 # SESSION STATE
 # ============================================================
 defaults = {
@@ -509,10 +795,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+account_col, logout_col = st.columns([8, 1])
+with account_col:
+    st.caption(f"Signed in as **{st.session_state.user_email}**")
+with logout_col:
+    if st.button("Log out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.user_email = ""
+        st.rerun()
+
 pages = [
     "Overview",
     "Smart Screening",
     "Candidates",
+    "Candidate Pipeline",
+    "Recruitment Analytics",
     "Interview Studio",
     "Shortlist Email",
     "Fairness Review",
@@ -800,7 +1097,11 @@ elif page == "Smart Screening":
                         st.session_state.job_text,
                         profile,
                     )
-                st.success("Candidate comparison is ready.")
+                    inferred_title = "Open Position"
+                    if isinstance(profile, dict):
+                        inferred_title = str(profile.get("job_title") or profile.get("title") or inferred_title)
+                    save_ranked_candidates(st.session_state.user_email, st.session_state.ranked, inferred_title[:120])
+                st.success("Candidate comparison is ready and saved to your pipeline.")
             except Exception as e:
                 st.error(f"Matching failed: {e}")
 
@@ -922,6 +1223,109 @@ elif page == "Candidates":
                 st.markdown("**Matching explanation**")
                 st.write(item.get("explanation", "No explanation available."))
                 st.caption("Match scores are assistive signals only. Review the original resume and apply human judgment.")
+
+
+# ============================================================
+# CANDIDATE PIPELINE
+# ============================================================
+elif page == "Candidate Pipeline":
+    st.markdown("""
+        <div class="tm-hero">
+            <span class="tm-hero-tag">03 / Hiring workflow</span>
+            <h2>Move every candidate forward.</h2>
+            <p>Track candidates from application through hiring, update their stage and keep recruiter notes in one place.</p>
+        </div>
+    """, unsafe_allow_html=True)
+    records = get_pipeline_records(st.session_state.user_email)
+    if not records:
+        st.info("Your pipeline is empty. Run a candidate comparison in Smart Screening to add candidates here.")
+        st.button("Go to Smart Screening →", type="primary", on_click=lambda: st.session_state.update({"main_navigation": "Smart Screening"}))
+    else:
+        stage_counts = {stage: sum(1 for r in records if r["stage"] == stage) for stage in PIPELINE_STAGES}
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Total candidates", len(records))
+        metric_cols[1].metric("In interview", stage_counts["Interview"])
+        metric_cols[2].metric("Selected", stage_counts["Selected"])
+        metric_cols[3].metric("Hired", stage_counts["Hired"])
+        section("Pipeline overview", "Candidate counts by current hiring stage.")
+        stage_df = pd.DataFrame([{"Stage": k, "Candidates": v} for k, v in stage_counts.items() if v])
+        if not stage_df.empty:
+            st.bar_chart(stage_df.set_index("Stage"), color="#087E78")
+        filter_col, search_col = st.columns([1, 1.5])
+        with filter_col:
+            stage_filter = st.selectbox("Filter by stage", ["All stages"] + PIPELINE_STAGES)
+        with search_col:
+            candidate_search = st.text_input("Find candidate", placeholder="Search by candidate or role")
+        filtered = [r for r in records if (stage_filter == "All stages" or r["stage"] == stage_filter)
+                    and (candidate_search.lower() in (r["candidate_id"] + " " + r["job_title"]).lower())]
+        section("Candidate records", f"Showing {len(filtered)} of {len(records)} candidates.")
+        for record in filtered:
+            title = f'{record["candidate_id"]}  ·  {record["job_title"]}  ·  {record["score"]:.1f}% match  ·  {record["stage"]}'
+            with st.expander(title):
+                info1, info2, info3 = st.columns(3)
+                info1.metric("Match signal", f'{record["score"]:.1f}%')
+                info2.metric("Experience", f'{record["experience_years"]:g} years')
+                info3.metric("Matched skills", len(record["matched_skills"]))
+                left, right = st.columns(2)
+                with left:
+                    st.markdown("**Matched skills**")
+                    st.write(" · ".join(record["matched_skills"]) or "No matched skills recorded.")
+                    st.markdown("**Skills to review**")
+                    st.write(" · ".join(record["missing_skills"]) or "No gaps recorded.")
+                with right:
+                    st.markdown("**Recruiter notes**")
+                    notes_value = st.text_area("Notes", value=record["notes"], key=f'pipeline_notes_{record["id"]}', height=100, label_visibility="collapsed", placeholder="Add interview feedback, follow-up actions or context...")
+                    new_stage = st.selectbox("Hiring stage", PIPELINE_STAGES, index=PIPELINE_STAGES.index(record["stage"]) if record["stage"] in PIPELINE_STAGES else 0, key=f'pipeline_stage_{record["id"]}')
+                    if st.button("Save candidate update", key=f'pipeline_save_{record["id"]}', type="primary"):
+                        if update_pipeline_record(record["id"], st.session_state.user_email, new_stage, notes_value):
+                            st.success("Candidate record updated.")
+                            st.rerun()
+                st.caption("Use match scores as supporting information only. Verify candidate evidence and make decisions with human review.")
+
+
+# ============================================================
+# RECRUITMENT ANALYTICS
+# ============================================================
+elif page == "Recruitment Analytics":
+    st.markdown("""
+        <div class="tm-hero">
+            <span class="tm-hero-tag">04 / Workspace insights</span>
+            <h2>Understand your hiring activity.</h2>
+            <p>Review candidate volume, pipeline conversion and match signals across the records saved to your account.</p>
+        </div>
+    """, unsafe_allow_html=True)
+    records = get_pipeline_records(st.session_state.user_email)
+    if not records:
+        st.info("Analytics will appear after you compare candidates in Smart Screening. Your results will be saved to your account pipeline.")
+        st.button("Start screening →", type="primary", on_click=lambda: st.session_state.update({"main_navigation": "Smart Screening"}))
+    else:
+        total = len(records)
+        hired = sum(1 for r in records if r["stage"] == "Hired")
+        shortlisted = sum(1 for r in records if r["stage"] in ["Shortlisted", "Interview", "Selected", "Hired"])
+        avg_score = sum(float(r["score"]) for r in records) / total
+        avg_exp = sum(float(r["experience_years"]) for r in records) / total
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Candidates tracked", total)
+        k2.metric("Shortlist+", shortlisted, f"{shortlisted / total * 100:.1f}% of tracked")
+        k3.metric("Hired", hired)
+        k4.metric("Average match signal", f"{avg_score:.1f}%")
+        section("Hiring funnel", "Current candidate distribution by stage; stages are editable in Candidate Pipeline.")
+        counts = {stage: sum(1 for r in records if r["stage"] == stage) for stage in PIPELINE_STAGES}
+        funnel_df = pd.DataFrame([{"Stage": stage, "Candidates": count} for stage, count in counts.items()])
+        chart_col, stats_col = st.columns([1.35, 1])
+        with chart_col:
+            st.bar_chart(funnel_df.set_index("Stage"), color="#087E78")
+        with stats_col:
+            st.markdown("**Stage breakdown**")
+            st.dataframe(funnel_df, use_container_width=True, hide_index=True)
+            st.metric("Average experience", f"{avg_exp:.1f} years")
+        section("Role-wise hiring activity", "Candidate counts and average match signal by job title.")
+        role_rows = []
+        for role in sorted(set(r["job_title"] for r in records)):
+            subset = [r for r in records if r["job_title"] == role]
+            role_rows.append({"Job title": role, "Candidates": len(subset), "Average match": round(sum(float(x["score"]) for x in subset) / len(subset), 1), "Hired": sum(1 for x in subset if x["stage"] == "Hired")})
+        st.dataframe(pd.DataFrame(role_rows), use_container_width=True, hide_index=True)
+        st.caption("Analytics reflect candidate records saved to this account. They are descriptive summaries, not measures of candidate quality or hiring fairness.")
 
 
 # ============================================================
